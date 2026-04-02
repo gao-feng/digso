@@ -320,6 +320,32 @@ function Analyze-Libraries {
         }
     }
 
+    $sameNameCounts = @{}
+    foreach ($group in ($libraryRows | Group-Object Library)) {
+        $sameNameCounts[[string]$group.Name] = $group.Count
+    }
+
+    $libraryRows = foreach ($row in $libraryRows) {
+        [pscustomobject]@{
+            Library         = $row.Library
+            SameNameCount   = $sameNameCounts[[string]$row.Library]
+            Inode           = $row.Inode
+            FileKey         = $row.FileKey
+            FilePath        = $row.FilePath
+            FileSizeKB      = $row.FileSizeKB
+            FileRssKB       = $row.FileRssKB
+            FilePssKB       = $row.FilePssKB
+            BssSizeKB       = $row.BssSizeKB
+            BssRssKB        = $row.BssRssKB
+            BssPssKB        = $row.BssPssKB
+            TotalRssKB      = $row.TotalRssKB
+            TotalPssKB      = $row.TotalPssKB
+            PrivateKB       = $row.PrivateKB
+            SharedKB        = $row.SharedKB
+            Segments        = $row.Segments
+        }
+    }
+
     $summary = [pscustomobject]@{
         FileLibraryCount = ($libraryRows | Measure-Object).Count
         BssLibraryCount  = (($libraryRows | Where-Object { $_.BssSizeKB -gt 0 }) | Measure-Object).Count
