@@ -1,0 +1,26 @@
+# Generated snapshot/result directories
+proc_*/
+compare_so_*/
+shared_file_usage_*/
+process_list_shared_files_*/
+zero_delta_lookup_*/
+
+# Local data folders
+Data/
+动态库信息/
+
+# Generated reports and raw data
+*.csv
+*.json
+*.txt
+
+# PowerShell transient/log files
+*.log
+*.tmp
+
+# Keep source scripts and batch entrypoints tracked
+!*.ps1
+!*.bat
+
+# Keep example input files tracked when desired
+!process_list.txt

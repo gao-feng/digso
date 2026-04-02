@@ -1,0 +1,10 @@
+com.jd.hm.mall
+com.dingtalk.hmos
+com.xingin.xhs_hos
+com.ss.hm.ugc.aweme
+com.kuaishou.hmapp
+com.sankuai.hmeituan
+com.sdu.didi.hmos.psnger
+com.zhihu.hmos
+com.tencent.wechat
+yylx.danmaku.bili
