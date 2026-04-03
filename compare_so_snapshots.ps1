@@ -174,6 +174,9 @@ function Get-FileType {
     if ($Path.StartsWith("/memfd:")) { return "Memfd" }
     if ($Path -match '^\[.*\]$') { return "SpecialMapping" }
     if (Test-IsLibraryFilePath -Path $Path) { return "DynamicLibrary" }
+    $fileName = [System.IO.Path]::GetFileName($Path)
+    $extension = [System.IO.Path]::GetExtension($fileName)
+    if (-not [string]::IsNullOrWhiteSpace($extension)) { return $extension.TrimStart('.').ToLowerInvariant() }
     if ($Path -match '^/(system|vendor|product|system_ext|apex)/.*/bin(/|$)' -or $Path -match '^/(system|vendor|product|system_ext)/bin(/|$)' -or $Path -match '/bin/[^/]+$') {
         return "ExecutableBinary"
     }
