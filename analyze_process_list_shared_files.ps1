@@ -257,20 +257,26 @@ function Parse-MapsFile {
     return $rows
 }
 
-function Test-IsInterestingLibraryPath {
+function Test-IsInterestingFilePath {
     param([string]$Path)
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     if (-not $Path.StartsWith("/")) { return $false }
     if ($Path.StartsWith("/dev/") -or $Path.StartsWith("/proc/") -or $Path.StartsWith("/memfd:")) { return $false }
-    # if ($Path.StartsWith("/system/") -or $Path.StartsWith("/vendor/")) { return $false }
+    return $true
+}
+
+function Test-IsLibraryPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     if ($Path -match '\.(so|dll|dylib)(\.\d+)*$' -or $Path -match '\.z\.so(\.\d+)*$') {
         return $true
     }
     return $false
 }
 
-function Get-LibraryIdentityKey {
+function Get-FileIdentityKey {
     param(
         [string]$Path,
         [Int64]$Inode
@@ -341,9 +347,9 @@ function Group-FileMappingsFromSmaps {
 
     $map = @{}
     foreach ($entry in $Entries) {
-        if (-not (Test-IsInterestingLibraryPath -Path $entry.Path)) { continue }
+        if (-not (Test-IsInterestingFilePath -Path $entry.Path)) { continue }
 
-        $fileKey = Get-LibraryIdentityKey -Path $entry.Path -Inode $entry.Inode
+        $fileKey = Get-FileIdentityKey -Path $entry.Path -Inode $entry.Inode
 
         if (-not $map.ContainsKey($fileKey)) {
             $map[$fileKey] = [ordered]@{
@@ -445,15 +451,15 @@ foreach ($proc in $targetProcesses) {
 
     $mapEntries = Parse-MapsFile -Path $mapsPath
     foreach ($entry in $mapEntries) {
-        if (-not (Test-IsInterestingLibraryPath -Path $entry.Path)) { continue }
-        $fileKey = Get-LibraryIdentityKey -Path $entry.Path -Inode $entry.Inode
+        if (-not (Test-IsInterestingFilePath -Path $entry.Path)) { continue }
+        $fileKey = Get-FileIdentityKey -Path $entry.Path -Inode $entry.Inode
         if (-not $targetFileMap.ContainsKey($fileKey)) {
             $targetFileMap[$fileKey] = [pscustomobject]@{
                 FileKey = $fileKey
                 Inode = [int64]$entry.Inode
                 FilePath = $entry.Path
                 FileName = [System.IO.Path]::GetFileName($entry.Path)
-                IsLibrary = $true
+                IsLibrary = (Test-IsLibraryPath -Path $entry.Path)
             }
         }
         $targetPathToKeyMap[$entry.Path] = $fileKey
@@ -473,7 +479,8 @@ foreach ($proc in $targetProcesses) {
             Inode = $usage.Inode
             FilePath = $usage.FilePath
             FileName = $usage.FileName
-            IsLibrary = $true
+            IsLibrary = (Test-IsLibraryPath -Path $usage.FilePath)
+            FileSizeKB = $usage.SizeKB
             TargetProcessPssKB = $usage.PssKB
             TargetProcessRssKB = $usage.RssKB
         }
@@ -481,7 +488,7 @@ foreach ($proc in $targetProcesses) {
 }
 
 if ($targetFileMap.Count -eq 0) {
-    throw "No interesting file-backed mappings found in target processes"
+    throw "No file-backed mappings found in target processes"
 }
 
 Write-Info "Capturing lsof"
@@ -549,6 +556,7 @@ foreach ($proc in ($relatedProcessMap.Values | Sort-Object @{ Expression = { [in
                 FilePath = $usage.FilePath
                 FileName = $usage.FileName
                 IsLibrary = $targetFileMap[$fileKey].IsLibrary
+                FileSizeKB = $usage.SizeKB
                 ProcessId = $proc.ProcessId
                 ProcessName = $proc.ProcessName
                 User = $proc.User
@@ -592,6 +600,7 @@ foreach ($group in ($detailRows | Group-Object FileKey)) {
         FilePath = $first.FilePath
         FileName = $first.FileName
         IsLibrary = $first.IsLibrary
+        FileSizeKB = $first.FileSizeKB
         SystemTotalPssKB = $systemTotalPss
         SystemTotalRssKB = $systemTotalRss
         ProcessCount = ($group.Group | Select-Object -ExpandProperty ProcessId -Unique | Measure-Object).Count
@@ -678,7 +687,7 @@ Write-Host ("JSON report        : {0}" -f $jsonPath)
 Write-Host ""
 
 Write-Host "Top files by system total PSS"
-$fileSummaryRows | Select-Object -First 20 FileName, IsLibrary, SystemTotalPssKB, ProcessCount, FilePath | Format-Table -AutoSize
+$fileSummaryRows | Select-Object -First 20 FileName, IsLibrary, FileSizeKB, SystemTotalPssKB, ProcessCount, FilePath | Format-Table -AutoSize
 
 Write-Host ""
 Write-Host "Top processes by shared-file PSS"

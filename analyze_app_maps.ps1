@@ -207,6 +207,24 @@ function Get-FileIdentityKey {
     return "path:$Path"
 }
 
+function Test-IsInterestingFilePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    if (-not ($Path.StartsWith("/") -or $Path -match '^[A-Za-z]:\\')) {
+        return $false
+    }
+
+    if ($Path.StartsWith("/dev/") -or $Path.StartsWith("/proc/") -or $Path.StartsWith("/memfd:")) {
+        return $false
+    }
+
+    return $true
+}
+
 function Test-IsLibraryFilePath {
     param([string]$Path)
 
@@ -229,7 +247,7 @@ function Get-BssLibraryName {
     return $null
 }
 
-function Add-LibMetrics {
+function Add-FileMetrics {
     param(
         [hashtable]$Map,
         [string]$Key,
@@ -273,36 +291,37 @@ function Add-LibMetrics {
     $item.Segments += 1
 }
 
-function Analyze-Libraries {
+function Analyze-FileMappings {
     param([object[]]$Entries)
 
-    $fileLibs = @{}
-    $bssLibs = @{}
+    $fileRowsMap = @{}
+    $bssRowsMap = @{}
 
     foreach ($entry in $Entries) {
-        if (Test-IsLibraryFilePath -Path $entry.Path) {
+        if (Test-IsInterestingFilePath -Path $entry.Path) {
             $fileKey = Get-FileIdentityKey -Path $entry.Path -Inode $entry.Inode
-            Add-LibMetrics -Map $fileLibs -Key $fileKey -DisplayPath $entry.Path -Entry $entry -Kind "file"
+            Add-FileMetrics -Map $fileRowsMap -Key $fileKey -DisplayPath $entry.Path -Entry $entry -Kind "file"
             continue
         }
 
         $bssName = Get-BssLibraryName -AnonPath $entry.Path
         if ($bssName) {
             $bssKey = Get-FileIdentityKey -Path $bssName -Inode 0
-            Add-LibMetrics -Map $bssLibs -Key $bssKey -DisplayPath $entry.Path -Entry $entry -Kind "bss"
+            Add-FileMetrics -Map $bssRowsMap -Key $bssKey -DisplayPath $entry.Path -Entry $entry -Kind "bss"
         }
     }
 
-    $libraryRows = foreach ($fileKey in $fileLibs.Keys) {
-        $fileRow = $fileLibs[$fileKey]
+    $fileRows = foreach ($fileKey in $fileRowsMap.Keys) {
+        $fileRow = $fileRowsMap[$fileKey]
         $bssRow = $null
         $bssLookupKey = Get-FileIdentityKey -Path $fileRow.DisplayPath -Inode 0
-        if ($bssLibs.ContainsKey($bssLookupKey)) {
-            $bssRow = $bssLibs[$bssLookupKey]
+        if ($bssRowsMap.ContainsKey($bssLookupKey)) {
+            $bssRow = $bssRowsMap[$bssLookupKey]
         }
 
         [pscustomobject]@{
-            Library         = [System.IO.Path]::GetFileName($fileRow.DisplayPath)
+            FileName        = [System.IO.Path]::GetFileName($fileRow.DisplayPath)
+            IsLibrary       = (Test-IsLibraryFilePath -Path $fileRow.DisplayPath)
             Inode           = [int64]$fileRow.Inode
             FileKey         = $fileKey
             FilePath        = $fileRow.DisplayPath
@@ -321,14 +340,15 @@ function Analyze-Libraries {
     }
 
     $sameNameCounts = @{}
-    foreach ($group in ($libraryRows | Group-Object Library)) {
+    foreach ($group in ($fileRows | Group-Object FileName)) {
         $sameNameCounts[[string]$group.Name] = $group.Count
     }
 
-    $libraryRows = foreach ($row in $libraryRows) {
+    $fileRows = foreach ($row in $fileRows) {
         [pscustomobject]@{
-            Library         = $row.Library
-            SameNameCount   = $sameNameCounts[[string]$row.Library]
+            FileName        = $row.FileName
+            SameNameCount   = $sameNameCounts[[string]$row.FileName]
+            IsLibrary       = $row.IsLibrary
             Inode           = $row.Inode
             FileKey         = $row.FileKey
             FilePath        = $row.FilePath
@@ -347,19 +367,20 @@ function Analyze-Libraries {
     }
 
     $summary = [pscustomobject]@{
-        FileLibraryCount = ($libraryRows | Measure-Object).Count
-        BssLibraryCount  = (($libraryRows | Where-Object { $_.BssSizeKB -gt 0 }) | Measure-Object).Count
-        FileRssKB        = (($libraryRows | Measure-Object -Property FileRssKB -Sum).Sum)
-        FilePssKB        = (($libraryRows | Measure-Object -Property FilePssKB -Sum).Sum)
-        BssRssKB         = (($libraryRows | Measure-Object -Property BssRssKB -Sum).Sum)
-        BssPssKB         = (($libraryRows | Measure-Object -Property BssPssKB -Sum).Sum)
-        TotalRssKB       = (($libraryRows | Measure-Object -Property TotalRssKB -Sum).Sum)
-        TotalPssKB       = (($libraryRows | Measure-Object -Property TotalPssKB -Sum).Sum)
+        FileCount        = ($fileRows | Measure-Object).Count
+        LibraryCount     = (($fileRows | Where-Object { $_.IsLibrary }) | Measure-Object).Count
+        FilesWithBssCount = (($fileRows | Where-Object { $_.BssSizeKB -gt 0 }) | Measure-Object).Count
+        FileRssKB        = (($fileRows | Measure-Object -Property FileRssKB -Sum).Sum)
+        FilePssKB        = (($fileRows | Measure-Object -Property FilePssKB -Sum).Sum)
+        BssRssKB         = (($fileRows | Measure-Object -Property BssRssKB -Sum).Sum)
+        BssPssKB         = (($fileRows | Measure-Object -Property BssPssKB -Sum).Sum)
+        TotalRssKB       = (($fileRows | Measure-Object -Property TotalRssKB -Sum).Sum)
+        TotalPssKB       = (($fileRows | Measure-Object -Property TotalPssKB -Sum).Sum)
     }
 
     return [pscustomobject]@{
         Summary   = $summary
-        Libraries = $libraryRows | Sort-Object -Property TotalPssKB, TotalRssKB -Descending
+        Files = $fileRows | Sort-Object -Property TotalPssKB, TotalRssKB -Descending
     }
 }
 
@@ -415,12 +436,12 @@ foreach ($required in @($smapsPath, $rollupPath)) {
 
 Write-Info "Parsing $smapsPath"
 $entries = Parse-Smaps -Path $smapsPath
-$analysis = Analyze-Libraries -Entries $entries
+$analysis = Analyze-FileMappings -Entries $entries
 $rollup = Read-Rollup -Path $rollupPath
 
-$reportName = if ([string]::IsNullOrWhiteSpace($ProcessName)) { "library_memory_$RunTimestamp" } else { "library_memory_${ProcessName}_$RunTimestamp" }
+$reportName = if ([string]::IsNullOrWhiteSpace($ProcessName)) { "file_memory_$RunTimestamp" } else { "file_memory_${ProcessName}_$RunTimestamp" }
 $csvPath = Join-Path $OutputDir "$reportName.csv"
-$analysis.Libraries | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+$analysis.Files | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
 
 $jsonPath = Join-Path $OutputDir "$reportName.json"
 $report = [pscustomobject]@{
@@ -428,27 +449,29 @@ $report = [pscustomobject]@{
     ProcessName = $ProcessName
     Rollup    = $rollup
     Summary   = $analysis.Summary
-    Libraries = $analysis.Libraries
+    Files     = $analysis.Files
 }
 $report | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
 
 Write-Host ""
-Write-Host "Library memory summary"
-Write-Host "----------------------"
+Write-Host "File memory summary"
+Write-Host "-------------------"
 Write-Host ("Process total RSS : {0} kB" -f $rollup.Rss)
 Write-Host ("Process total PSS : {0} kB" -f $rollup.Pss)
-Write-Host ("Library file RSS  : {0} kB" -f $analysis.Summary.FileRssKB)
-Write-Host ("Library file PSS  : {0} kB" -f $analysis.Summary.FilePssKB)
-Write-Host ("Library bss RSS   : {0} kB" -f $analysis.Summary.BssRssKB)
-Write-Host ("Library bss PSS   : {0} kB" -f $analysis.Summary.BssPssKB)
-Write-Host ("Library total RSS : {0} kB" -f $analysis.Summary.TotalRssKB)
-Write-Host ("Library total PSS : {0} kB" -f $analysis.Summary.TotalPssKB)
+Write-Host ("Tracked files     : {0}" -f $analysis.Summary.FileCount)
+Write-Host ("Tracked libraries : {0}" -f $analysis.Summary.LibraryCount)
+Write-Host ("File-backed RSS   : {0} kB" -f $analysis.Summary.FileRssKB)
+Write-Host ("File-backed PSS   : {0} kB" -f $analysis.Summary.FilePssKB)
+Write-Host ("Bss RSS           : {0} kB" -f $analysis.Summary.BssRssKB)
+Write-Host ("Bss PSS           : {0} kB" -f $analysis.Summary.BssPssKB)
+Write-Host ("Tracked total RSS : {0} kB" -f $analysis.Summary.TotalRssKB)
+Write-Host ("Tracked total PSS : {0} kB" -f $analysis.Summary.TotalPssKB)
 Write-Host ("CSV report        : {0}" -f $csvPath)
 Write-Host ("JSON report       : {0}" -f $jsonPath)
 Write-Host ""
 
-$analysis.Libraries |
-    Select-Object -First 30 Library, TotalPssKB, TotalRssKB, FilePssKB, BssPssKB, Segments, FilePath |
+$analysis.Files |
+    Select-Object -First 30 FileName, IsLibrary, TotalPssKB, TotalRssKB, FilePssKB, BssPssKB, Segments, FilePath |
     Format-Table -AutoSize
 
 if (-not $KeepRawFiles -and $PSCmdlet.ParameterSetName -eq "Capture") {

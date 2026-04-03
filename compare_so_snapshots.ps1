@@ -134,6 +134,24 @@ function Get-FileIdentityKey {
     return "path:$Path"
 }
 
+function Test-IsInterestingFilePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    if (-not ($Path.StartsWith("/") -or $Path -match '^[A-Za-z]:\\')) {
+        return $false
+    }
+
+    if ($Path.StartsWith("/dev/") -or $Path.StartsWith("/proc/") -or $Path.StartsWith("/memfd:")) {
+        return $false
+    }
+
+    return $true
+}
+
 function Test-IsLibraryFilePath {
     param([string]$Path)
 
@@ -156,7 +174,7 @@ function Get-BssLibraryName {
     return $null
 }
 
-function Add-LibMetrics {
+function Add-FileMetrics {
     param(
         [hashtable]$Map,
         [string]$Key,
@@ -193,38 +211,40 @@ function Add-LibMetrics {
     $item.Segments += 1
 }
 
-function Analyze-LibrariesFromSmaps {
+function Analyze-FilesFromSmaps {
     param([string]$SmapsPath)
 
     $entries = Parse-Smaps -Path $SmapsPath
-    $fileLibs = @{}
-    $bssLibs = @{}
+    $fileRowsMap = @{}
+    $bssRowsMap = @{}
 
     foreach ($entry in $entries) {
-        if (Test-IsLibraryFilePath -Path $entry.Path) {
+        if (Test-IsInterestingFilePath -Path $entry.Path) {
             $fileKey = Get-FileIdentityKey -Path $entry.Path -Inode $entry.Inode
-            Add-LibMetrics -Map $fileLibs -Key $fileKey -Entry $entry
+            Add-FileMetrics -Map $fileRowsMap -Key $fileKey -Entry $entry
             continue
         }
 
         $bssName = Get-BssLibraryName -AnonPath $entry.Path
         if ($bssName) {
             $bssKey = Get-FileIdentityKey -Path $bssName -Inode 0
-            Add-LibMetrics -Map $bssLibs -Key $bssKey -Entry $entry
+            Add-FileMetrics -Map $bssRowsMap -Key $bssKey -Entry $entry
         }
     }
 
-    $rows = foreach ($fileKey in $fileLibs.Keys) {
-        $fileRow = $fileLibs[$fileKey]
+    $rows = foreach ($fileKey in $fileRowsMap.Keys) {
+        $fileRow = $fileRowsMap[$fileKey]
         $bssLookupKey = Get-FileIdentityKey -Path $fileRow.FilePath -Inode 0
-        $bssRow = if ($bssLibs.ContainsKey($bssLookupKey)) { $bssLibs[$bssLookupKey] } else { $null }
+        $bssRow = if ($bssRowsMap.ContainsKey($bssLookupKey)) { $bssRowsMap[$bssLookupKey] } else { $null }
         $filePath = [string]$fileRow.FilePath
 
         [pscustomobject]@{
-            Library = [System.IO.Path]::GetFileName($(if ($filePath) { $filePath } else { $fileKey }))
+            FileName = [System.IO.Path]::GetFileName($(if ($filePath) { $filePath } else { $fileKey }))
+            IsLibrary = (Test-IsLibraryFilePath -Path $filePath)
             Inode = [int64]$fileRow.Inode
             FileKey = $fileKey
             FilePath = $filePath
+            FileSizeKB = $fileRow.Size
             TotalPssKB = $fileRow.Pss + $(if ($bssRow) { $bssRow.Pss } else { 0 })
             TotalRssKB = $fileRow.Rss + $(if ($bssRow) { $bssRow.Rss } else { 0 })
             FilePssKB = $fileRow.Pss
@@ -238,36 +258,65 @@ function Analyze-LibrariesFromSmaps {
     return $rows
 }
 
-function Get-LibraryRowsFromSnapshotDir {
+function Get-FileRowsFromSnapshotDir {
     param([string]$DirPath)
 
-    $jsonCandidate = Get-ChildItem -LiteralPath $DirPath -Filter "library_memory_*.json" -File -ErrorAction SilentlyContinue |
+    $jsonCandidate = Get-ChildItem -LiteralPath $DirPath -Filter "file_memory_*.json" -File -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
+
+    if (-not $jsonCandidate) {
+        $jsonCandidate = Get-ChildItem -LiteralPath $DirPath -Filter "library_memory_*.json" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+    }
 
     if ($jsonCandidate) {
         Write-Info "Using existing JSON report: $($jsonCandidate.FullName)"
         $raw = Get-Content -LiteralPath $jsonCandidate.FullName -Raw | ConvertFrom-Json
         $processName = if ($raw.ProcessName) { [string]$raw.ProcessName } else { "" }
+        $rows = @()
+        if ($raw.PSObject.Properties.Name -contains "Files") {
+            $rows = @($raw.Files)
+        } elseif ($raw.PSObject.Properties.Name -contains "Libraries") {
+            $rows = @($raw.Libraries | ForEach-Object {
+                [pscustomobject]@{
+                    FileName = if ($_.PSObject.Properties.Name -contains "FileName") { [string]$_.FileName } else { [string]$_.Library }
+                    IsLibrary = if ($_.PSObject.Properties.Name -contains "IsLibrary") { [bool]$_.IsLibrary } else { $true }
+                    Inode = [int64]$_.Inode
+                    FileKey = [string]$_.FileKey
+                    FilePath = [string]$_.FilePath
+                    FileSizeKB = if ($_.PSObject.Properties.Name -contains "FileSizeKB") { [int64]$_.FileSizeKB } elseif ($_.PSObject.Properties.Name -contains "SizeKB") { [int64]$_.SizeKB } else { 0 }
+                    TotalPssKB = [int64]$_.TotalPssKB
+                    TotalRssKB = [int64]$_.TotalRssKB
+                    FilePssKB = [int64]$_.FilePssKB
+                    FileRssKB = [int64]$_.FileRssKB
+                    BssPssKB = if ($_.PSObject.Properties.Name -contains "BssPssKB") { [int64]$_.BssPssKB } else { 0 }
+                    BssRssKB = if ($_.PSObject.Properties.Name -contains "BssRssKB") { [int64]$_.BssRssKB } else { 0 }
+                    Segments = if ($_.PSObject.Properties.Name -contains "Segments") { [int64]$_.Segments } else { 0 }
+                }
+            })
+        }
+
         return [pscustomobject]@{
             ProcessName = $processName
-            Libraries = @($raw.Libraries)
+            Files = $rows
         }
     }
 
     $smapsPath = Join-Path $DirPath "smaps"
     if (-not (Test-Path -LiteralPath $smapsPath)) {
-        throw "No library report or smaps found in $DirPath"
+        throw "No file report or smaps found in $DirPath"
     }
 
     Write-Info "No JSON report found, parsing $smapsPath"
     return [pscustomobject]@{
         ProcessName = ""
-        Libraries = @(Analyze-LibrariesFromSmaps -SmapsPath $smapsPath)
+        Files = @(Analyze-FilesFromSmaps -SmapsPath $smapsPath)
     }
 }
 
-function Compare-LibraryRows {
+function Compare-FileRows {
     param(
         [object[]]$BeforeRows,
         [object[]]$AfterRows
@@ -295,12 +344,17 @@ function Compare-LibraryRows {
         $afterPss = if ($after) { [int64]$after.TotalPssKB } else { 0 }
         $beforeRss = if ($before) { [int64]$before.TotalRssKB } else { 0 }
         $afterRss = if ($after) { [int64]$after.TotalRssKB } else { 0 }
+        $beforeSize = if ($before -and $before.PSObject.Properties.Name -contains "FileSizeKB") { [int64]$before.FileSizeKB } else { 0 }
+        $afterSize = if ($after -and $after.PSObject.Properties.Name -contains "FileSizeKB") { [int64]$after.FileSizeKB } else { 0 }
 
         [pscustomobject]@{
-            Library = if ($after) { [string]$after.Library } elseif ($before) { [string]$before.Library } else { "" }
+            FileName = if ($after) { [string]$(if ($after.PSObject.Properties.Name -contains "FileName") { $after.FileName } else { $after.Library }) } elseif ($before) { [string]$(if ($before.PSObject.Properties.Name -contains "FileName") { $before.FileName } else { $before.Library }) } else { "" }
+            IsLibrary = if ($after -and $after.PSObject.Properties.Name -contains "IsLibrary") { [bool]$after.IsLibrary } elseif ($before -and $before.PSObject.Properties.Name -contains "IsLibrary") { [bool]$before.IsLibrary } else { $true }
             Inode = [int64]$(if ($after -and $after.PSObject.Properties.Name -contains "Inode") { $after.Inode } elseif ($before -and $before.PSObject.Properties.Name -contains "Inode") { $before.Inode } else { 0 })
             FileKey = $key
             FilePath = [string]$(if ($after) { $after.FilePath } elseif ($before) { $before.FilePath } else { "" })
+            BeforeFileSizeKB = $beforeSize
+            AfterFileSizeKB = $afterSize
             BeforePssKB = $beforePss
             AfterPssKB = $afterPss
             DeltaPssKB = $afterPss - $beforePss
@@ -327,13 +381,13 @@ if (-not $OutputDir) {
     $procIdLabel = if ($beforeMeta.Pid -gt 0) { $beforeMeta.Pid } else { "unknown" }
     $beforeTs = if ($beforeMeta.Timestamp) { $beforeMeta.Timestamp } else { "before" }
     $afterTs = if ($afterMeta.Timestamp) { $afterMeta.Timestamp } else { "after" }
-    $OutputDir = Join-Path (Get-Location) "compare_so_${name}_${procIdLabel}_${beforeTs}_vs_${afterTs}"
+    $OutputDir = Join-Path (Get-Location) "compare_files_${name}_${procIdLabel}_${beforeTs}_vs_${afterTs}"
 }
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-$beforeSnapshot = Get-LibraryRowsFromSnapshotDir -DirPath $BeforeDir
-$afterSnapshot = Get-LibraryRowsFromSnapshotDir -DirPath $AfterDir
+$beforeSnapshot = Get-FileRowsFromSnapshotDir -DirPath $BeforeDir
+$afterSnapshot = Get-FileRowsFromSnapshotDir -DirPath $AfterDir
 
 $effectiveBeforeName = if ($beforeSnapshot.ProcessName) { $beforeSnapshot.ProcessName } else { $beforeMeta.ProcessName }
 $effectiveAfterName = if ($afterSnapshot.ProcessName) { $afterSnapshot.ProcessName } else { $afterMeta.ProcessName }
@@ -346,7 +400,7 @@ if ($effectiveBeforeName -and $effectiveAfterName -and $effectiveBeforeName -ne 
     throw "Process name mismatch: $effectiveBeforeName vs $effectiveAfterName"
 }
 
-$diffRows = Compare-LibraryRows -BeforeRows $beforeSnapshot.Libraries -AfterRows $afterSnapshot.Libraries
+$diffRows = Compare-FileRows -BeforeRows $beforeSnapshot.Files -AfterRows $afterSnapshot.Files
 
 $summary = [pscustomobject]@{
     ProcessName = if ($effectiveAfterName) { $effectiveAfterName } else { $effectiveBeforeName }
@@ -355,9 +409,9 @@ $summary = [pscustomobject]@{
     AfterDir = $AfterDir
     BeforeTimestamp = $beforeMeta.Timestamp
     AfterTimestamp = $afterMeta.Timestamp
-    AddedLibraries = (($diffRows | Where-Object { $_.ChangeType -eq "added" }) | Measure-Object).Count
-    RemovedLibraries = (($diffRows | Where-Object { $_.ChangeType -eq "removed" }) | Measure-Object).Count
-    ChangedLibraries = (($diffRows | Where-Object { $_.ChangeType -eq "changed" -and $_.DeltaPssKB -ne 0 }) | Measure-Object).Count
+    AddedFiles = (($diffRows | Where-Object { $_.ChangeType -eq "added" }) | Measure-Object).Count
+    RemovedFiles = (($diffRows | Where-Object { $_.ChangeType -eq "removed" }) | Measure-Object).Count
+    ChangedFiles = (($diffRows | Where-Object { $_.ChangeType -eq "changed" -and $_.DeltaPssKB -ne 0 }) | Measure-Object).Count
     BeforeTotalPssKB = (($diffRows | Measure-Object -Property BeforePssKB -Sum).Sum)
     AfterTotalPssKB = (($diffRows | Measure-Object -Property AfterPssKB -Sum).Sum)
     DeltaTotalPssKB = (($diffRows | Measure-Object -Property DeltaPssKB -Sum).Sum)
@@ -366,7 +420,7 @@ $summary = [pscustomobject]@{
     DeltaTotalRssKB = (($diffRows | Measure-Object -Property DeltaRssKB -Sum).Sum)
 }
 
-$reportBase = "compare_so_{0}_{1}_{2}_vs_{3}" -f `
+$reportBase = "compare_files_{0}_{1}_{2}_vs_{3}" -f `
     (Get-SafePathName -Name $(if ($summary.ProcessName) { $summary.ProcessName } else { "unknown" })), `
     $(if ($summary.ProcessId) { $summary.ProcessId } else { "unknown" }), `
     $(if ($summary.BeforeTimestamp) { $summary.BeforeTimestamp } else { "before" }), `
@@ -384,8 +438,8 @@ $report = [pscustomobject]@{
 $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
 
 Write-Host ""
-Write-Host "SO memory diff summary"
-Write-Host "----------------------"
+Write-Host "File memory diff summary"
+Write-Host "------------------------"
 Write-Host ("Process name     : {0}" -f $summary.ProcessName)
 Write-Host ("PID              : {0}" -f $summary.ProcessId)
 Write-Host ("Before total PSS : {0} kB" -f $summary.BeforeTotalPssKB)
@@ -401,7 +455,7 @@ Write-Host ""
 Write-Host "Top PSS increases"
 $diffRows |
     Where-Object { $_.DeltaPssKB -gt 0 } |
-    Select-Object -First 20 Library, DeltaPssKB, AfterPssKB, BeforePssKB, ChangeType, FilePath |
+    Select-Object -First 20 FileName, IsLibrary, AfterFileSizeKB, DeltaPssKB, AfterPssKB, BeforePssKB, ChangeType, FilePath |
     Format-Table -AutoSize
 
 Write-Host ""
@@ -409,7 +463,7 @@ Write-Host "Top PSS decreases"
 $diffRows |
     Sort-Object DeltaPssKB |
     Where-Object { $_.DeltaPssKB -lt 0 } |
-    Select-Object -First 20 Library, DeltaPssKB, AfterPssKB, BeforePssKB, ChangeType, FilePath |
+    Select-Object -First 20 FileName, IsLibrary, BeforeFileSizeKB, DeltaPssKB, AfterPssKB, BeforePssKB, ChangeType, FilePath |
     Format-Table -AutoSize
 
 if ($Json) {

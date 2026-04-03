@@ -1,5 +1,5 @@
 :: 用途:
-:: - 调用 compare_so_snapshots.ps1，比较两个抓取目录中动态库物理内存占用的变化。
+:: - 调用 compare_so_snapshots.ps1，比较两个抓取目录中普通文件/动态库物理内存占用的变化。
 :: 参数:
 :: - 第一个参数是 BEFORE 目录，第二个参数是 AFTER 目录；如果不传则会提示输入。
 @echo off

@@ -391,6 +391,7 @@ foreach ($proc in $processInfos) {
                 Inode = $targetFile.Inode
                 FilePath = $targetFile.FilePath
                 FileName = $targetFile.FileName
+                FileSizeKB = $targetFile.SizeKB
                 TargetProcessPssKB = $targetFile.PssKB
                 TargetProcessRssKB = $targetFile.RssKB
                 ProcessId = $procId
@@ -417,6 +418,7 @@ $summaryRows = foreach ($fileGroup in ($usageRows | Group-Object FileKey)) {
         Inode = $first.Inode
         FilePath = $first.FilePath
         FileName = $first.FileName
+        FileSizeKB = $first.FileSizeKB
         TargetProcessPssKB = $first.TargetProcessPssKB
         TargetProcessRssKB = $first.TargetProcessRssKB
         SystemTotalPssKB = (($fileGroup.Group | Measure-Object -Property ProcessPssKB -Sum).Sum)
@@ -474,7 +476,7 @@ Write-Host ("JSON report      : {0}" -f $jsonPath)
 Write-Host ""
 
 Write-Host "Top shared files by system PSS"
-$summaryRows | Select-Object -First 20 FileName, SystemTotalPssKB, TargetProcessPssKB, ProcessCount, FilePath | Format-Table -AutoSize
+$summaryRows | Select-Object -First 20 FileName, FileSizeKB, SystemTotalPssKB, TargetProcessPssKB, ProcessCount, FilePath | Format-Table -AutoSize
 
 Write-Host ""
 Write-Host "Top related processes by shared-file PSS"
