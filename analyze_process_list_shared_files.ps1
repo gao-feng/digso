@@ -276,6 +276,16 @@ function Test-IsLibraryPath {
     return $false
 }
 
+function Get-FileSourceCategory {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "其他文件" }
+    if ($Path.StartsWith("/data/storage/el1/bundle/arkwebcore/libs/")) { return "系统库" }
+    if ($Path.StartsWith("/system/") -or $Path.StartsWith("/vendor/")) { return "系统库" }
+    if ($Path.StartsWith("/data/")) { return "应用自带库" }
+    return "其他文件"
+}
+
 function Get-FileType {
     param([string]$Path)
 
@@ -480,6 +490,7 @@ foreach ($proc in $targetProcesses) {
                 FileName = [System.IO.Path]::GetFileName($entry.Path)
                 FileType = (Get-FileType -Path $entry.Path)
                 IsLibrary = (Test-IsLibraryPath -Path $entry.Path)
+                SourceCategory = (Get-FileSourceCategory -Path $entry.Path)
             }
         }
         $targetPathToKeyMap[$entry.Path] = $fileKey
@@ -501,6 +512,7 @@ foreach ($proc in $targetProcesses) {
             FileName = $usage.FileName
             FileType = (Get-FileType -Path $usage.FilePath)
             IsLibrary = (Test-IsLibraryPath -Path $usage.FilePath)
+            SourceCategory = (Get-FileSourceCategory -Path $usage.FilePath)
             FileSizeKB = $usage.SizeKB
             TargetProcessPssKB = $usage.PssKB
             TargetProcessRssKB = $usage.RssKB
@@ -578,6 +590,7 @@ foreach ($proc in ($relatedProcessMap.Values | Sort-Object @{ Expression = { [in
                 FileName = $usage.FileName
                 FileType = (Get-FileType -Path $usage.FilePath)
                 IsLibrary = $targetFileMap[$fileKey].IsLibrary
+                SourceCategory = $targetFileMap[$fileKey].SourceCategory
                 FileSizeKB = $usage.SizeKB
                 ProcessId = $proc.ProcessId
                 ProcessName = $proc.ProcessName
@@ -623,6 +636,7 @@ foreach ($group in ($detailRows | Group-Object FileKey)) {
         FileName = $first.FileName
         FileType = $first.FileType
         IsLibrary = $first.IsLibrary
+        SourceCategory = $first.SourceCategory
         FileSizeKB = $first.FileSizeKB
         SystemTotalPssKB = $systemTotalPss
         SystemTotalRssKB = $systemTotalRss
@@ -710,7 +724,7 @@ Write-Host ("JSON report        : {0}" -f $jsonPath)
 Write-Host ""
 
 Write-Host "Top files by system total PSS"
-$fileSummaryRows | Select-Object -First 20 FileName, FileType, IsLibrary, FileSizeKB, SystemTotalPssKB, ProcessCount, FilePath | Format-Table -AutoSize
+$fileSummaryRows | Select-Object -First 20 FileName, SourceCategory, FileType, IsLibrary, FileSizeKB, SystemTotalPssKB, ProcessCount, FilePath | Format-Table -AutoSize
 
 Write-Host ""
 Write-Host "Top processes by shared-file PSS"
