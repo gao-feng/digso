@@ -24,6 +24,9 @@
 /oh/digso/*.txt
 /oh/digso/*.log
 /oh/digso/*.tmp
+/oh/digso/__pycache__/
+/oh/digso/*.pyc
+/oh/digso/*.pyc.*
 !/oh/digso/*.ps1
 !/oh/digso/*.bat
 !/oh/digso/process_list.txt

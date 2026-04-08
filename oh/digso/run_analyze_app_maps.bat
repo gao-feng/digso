@@ -6,10 +6,10 @@
 setlocal EnableDelayedExpansion
 
 set "SCRIPT_DIR=%~dp0"
-set "PS_SCRIPT=%SCRIPT_DIR%analyze_app_maps.ps1"
+set "PY_SCRIPT=%SCRIPT_DIR%digso.py"
 
-if not exist "%PS_SCRIPT%" (
-  echo analyze_app_maps.ps1 not found: %PS_SCRIPT%
+if not exist "%PY_SCRIPT%" (
+  echo digso.py not found: %PY_SCRIPT%
   exit /b 1
 )
 
@@ -25,9 +25,9 @@ if "%~1"=="" (
 )
 
 if exist "%ARG1%\\smaps" (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" -SourceDir "%ARG1%"
+  python "%PY_SCRIPT%" analyze-app-maps --source-dir "%ARG1%"
 ) else (
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" -TargetPid %ARG1%
+  python "%PY_SCRIPT%" analyze-app-maps --target-pid %ARG1%
 )
 
 exit /b %errorlevel%

@@ -6,10 +6,10 @@
 setlocal EnableDelayedExpansion
 
 set "SCRIPT_DIR=%~dp0"
-set "PS_SCRIPT=%SCRIPT_DIR%list_zero_delta_filepss.ps1"
+set "PY_SCRIPT=%SCRIPT_DIR%digso.py"
 
-if not exist "%PS_SCRIPT%" (
-  echo list_zero_delta_filepss.ps1 not found: %PS_SCRIPT%
+if not exist "%PY_SCRIPT%" (
+  echo digso.py not found: %PY_SCRIPT%
   exit /b 1
 )
 
@@ -35,6 +35,6 @@ if "%~2"=="" (
   set "ARG2=%~2"
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" "%ARG1%" "%ARG2%"
+python "%PY_SCRIPT%" list-zero-delta-filepss "%ARG1%" "%ARG2%"
 
 exit /b %errorlevel%

@@ -6,10 +6,10 @@
 setlocal EnableDelayedExpansion
 
 set "SCRIPT_DIR=%~dp0"
-set "PS_SCRIPT=%SCRIPT_DIR%force_swapout_memcg.ps1"
+set "PY_SCRIPT=%SCRIPT_DIR%digso.py"
 
-if not exist "%PS_SCRIPT%" (
-  echo force_swapout_memcg.ps1 not found: %PS_SCRIPT%
+if not exist "%PY_SCRIPT%" (
+  echo digso.py not found: %PY_SCRIPT%
   exit /b 1
 )
 
@@ -24,6 +24,6 @@ if "%~1"=="" (
   set "TARGET_PID=%~1"
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS_SCRIPT%" %TARGET_PID%
+python "%PY_SCRIPT%" force-swapout-memcg %TARGET_PID%
 
 exit /b %errorlevel%
