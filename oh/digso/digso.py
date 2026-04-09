@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 from collections import defaultdict
@@ -79,6 +80,127 @@ def write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def read_c_string(blob: bytes, offset: int) -> str:
+    if offset < 0 or offset >= len(blob):
+        return ""
+    end = blob.find(b"\x00", offset)
+    if end < 0:
+        end = len(blob)
+    return blob[offset:end].decode("utf-8", errors="replace")
+
+
+def normalize_remote_device_path(path: str) -> str:
+    return re.sub(r"/+", "/", path.strip())
+
+
+def remote_path_to_local_export_path(remote_path: str, export_root: Path) -> Path:
+    parts = [part for part in normalize_remote_device_path(remote_path).split("/") if part]
+    safe_parts = [part.replace(":", "_") for part in parts]
+    return export_root.joinpath(*safe_parts)
+
+
+def vaddr_to_file_offset(vaddr: int, load_segments: list[dict]) -> int | None:
+    for segment in load_segments:
+        start = segment["vaddr"]
+        end = start + max(segment["filesz"], segment["memsz"])
+        if start <= vaddr < end:
+            return segment["offset"] + (vaddr - start)
+    return None
+
+
+def parse_elf_dynamic_info(path: Path) -> dict:
+    data = path.read_bytes()
+    if len(data) < 16 or data[:4] != b"\x7fELF":
+        raise DigsoError(f"Not an ELF file: {path}")
+
+    ei_class = data[4]
+    ei_data = data[5]
+    if ei_class not in (1, 2):
+        raise DigsoError(f"Unsupported ELF class in {path}")
+    if ei_data not in (1, 2):
+        raise DigsoError(f"Unsupported ELF endian in {path}")
+
+    endian = "<" if ei_data == 1 else ">"
+    if ei_class == 1:
+        header_fmt = endian + "16sHHIIIIIHHHHHH"
+        ph_fmt = endian + "IIIIIIII"
+        dyn_fmt = endian + "II"
+        phoff_index = 5
+        phentsize_index = 9
+        phnum_index = 10
+        pt_type_idx = 0
+        pt_offset_idx = 1
+        pt_vaddr_idx = 2
+        pt_filesz_idx = 4
+        pt_memsz_idx = 5
+    else:
+        header_fmt = endian + "16sHHIQQQIHHHHHH"
+        ph_fmt = endian + "IIQQQQQQ"
+        dyn_fmt = endian + "QQ"
+        phoff_index = 5
+        phentsize_index = 9
+        phnum_index = 10
+        pt_type_idx = 0
+        pt_offset_idx = 2
+        pt_vaddr_idx = 3
+        pt_filesz_idx = 5
+        pt_memsz_idx = 6
+
+    header = struct.unpack_from(header_fmt, data, 0)
+    phoff = header[phoff_index]
+    phentsize = header[phentsize_index]
+    phnum = header[phnum_index]
+
+    load_segments = []
+    dynamic_segment = None
+    for index in range(phnum):
+        offset = phoff + index * phentsize
+        ph = struct.unpack_from(ph_fmt, data, offset)
+        segment = {
+            "type": ph[pt_type_idx],
+            "offset": ph[pt_offset_idx],
+            "vaddr": ph[pt_vaddr_idx],
+            "filesz": ph[pt_filesz_idx],
+            "memsz": ph[pt_memsz_idx],
+        }
+        if segment["type"] == 1:
+            load_segments.append(segment)
+        elif segment["type"] == 2:
+            dynamic_segment = segment
+
+    if dynamic_segment is None:
+        return {"Soname": "", "Needed": [], "ParseStatus": "no_dynamic_segment"}
+
+    dyn_entry_size = struct.calcsize(dyn_fmt)
+    dyn_entries = []
+    dyn_offset = dynamic_segment["offset"]
+    dyn_limit = dyn_offset + dynamic_segment["filesz"]
+    while dyn_offset + dyn_entry_size <= dyn_limit:
+        tag, value = struct.unpack_from(dyn_fmt, data, dyn_offset)
+        dyn_entries.append((tag, value))
+        dyn_offset += dyn_entry_size
+        if tag == 0:
+            break
+
+    strtab_vaddr = next((value for tag, value in dyn_entries if tag == 5), None)
+    strtab_size = next((value for tag, value in dyn_entries if tag == 10), 0)
+    if strtab_vaddr is None:
+        return {"Soname": "", "Needed": [], "ParseStatus": "missing_strtab"}
+
+    strtab_offset = vaddr_to_file_offset(strtab_vaddr, load_segments)
+    if strtab_offset is None:
+        return {"Soname": "", "Needed": [], "ParseStatus": "unmapped_strtab"}
+
+    strtab_blob = data[strtab_offset : strtab_offset + strtab_size]
+    needed = [read_c_string(strtab_blob, value) for tag, value in dyn_entries if tag == 1]
+    soname_offsets = [value for tag, value in dyn_entries if tag == 14]
+    return {
+        "Soname": read_c_string(strtab_blob, soname_offsets[0]) if soname_offsets else "",
+        "Needed": [name for name in needed if name],
+        "ParseStatus": "ok",
+    }
+
+
 @dataclass
 class SmapsEntry:
     path: str
@@ -136,6 +258,12 @@ class HdcClient:
             return safe_name(self.shell(f"cat /proc/{pid}/comm").strip())
         except DigsoError:
             return "unknown"
+
+    def get_process_exe(self, pid: int) -> str:
+        try:
+            return normalize_remote_device_path(self.shell(f"readlink -f /proc/{pid}/exe").strip())
+        except DigsoError:
+            return ""
 
 
 def split_lines(text: str) -> list[str]:
@@ -521,11 +649,159 @@ def rows_from_snapshot_dir(dir_path: Path) -> dict:
     return {"ProcessName": "", "Files": analysis["Files"]}
 
 
+def export_remote_elfs(client: HdcClient, remote_paths: list[str], export_root: Path) -> dict[str, dict]:
+    ensure_dir(export_root)
+    manifest: dict[str, dict] = {}
+    for remote_path in sorted({normalize_remote_device_path(item) for item in remote_paths if item}):
+        local_path = remote_path_to_local_export_path(remote_path, export_root)
+        ensure_dir(local_path.parent)
+        try:
+            info(f"Exporting ELF: {remote_path}")
+            client.recv(remote_path, local_path)
+            manifest[remote_path] = {"RemotePath": remote_path, "LocalPath": str(local_path), "Exported": True, "Error": ""}
+        except DigsoError as exc:
+            manifest[remote_path] = {"RemotePath": remote_path, "LocalPath": str(local_path), "Exported": False, "Error": str(exc)}
+    return manifest
+
+
+def analyze_library_import_sources(files: list[dict], process_exe: str, export_root: Path, export_manifest: dict[str, dict] | None = None) -> dict:
+    libraries = [row for row in files if row.get("IsLibrary") and row.get("FilePath")]
+    loaded_paths = sorted({normalize_remote_device_path(row["FilePath"]) for row in libraries})
+    parsed_map: dict[str, dict] = {}
+    manifest = export_manifest or {}
+
+    candidate_paths = list(loaded_paths)
+    if process_exe:
+        candidate_paths.append(normalize_remote_device_path(process_exe))
+
+    for remote_path in sorted(set(candidate_paths)):
+        local_path = remote_path_to_local_export_path(remote_path, export_root)
+        export_info = manifest.get(remote_path, {"Exported": local_path.exists(), "Error": "", "LocalPath": str(local_path)})
+        parsed = {
+            "RemotePath": remote_path,
+            "LocalPath": str(local_path),
+            "Exported": bool(export_info.get("Exported", local_path.exists())),
+            "ParseStatus": "missing_local_copy",
+            "Error": export_info.get("Error", ""),
+            "Soname": "",
+            "Needed": [],
+        }
+        if local_path.exists():
+            try:
+                elf_info = parse_elf_dynamic_info(local_path)
+                parsed.update(elf_info)
+            except Exception as exc:  # keep import analysis best-effort
+                parsed["ParseStatus"] = "parse_failed"
+                parsed["Error"] = str(exc)
+        parsed_map[remote_path] = parsed
+
+    by_basename: dict[str, set[str]] = defaultdict(set)
+    by_soname: dict[str, set[str]] = defaultdict(set)
+    for lib_path in loaded_paths:
+        by_basename[os.path.basename(lib_path)].add(lib_path)
+        soname = parsed_map.get(lib_path, {}).get("Soname", "")
+        if soname:
+            by_soname[soname].add(lib_path)
+
+    edges = []
+    incoming_by_target: dict[str, list[dict]] = defaultdict(list)
+    outgoing_by_importer: dict[str, list[str]] = defaultdict(list)
+    for importer_path in sorted(set(candidate_paths)):
+        importer_info = parsed_map.get(importer_path)
+        if not importer_info or importer_info.get("ParseStatus") != "ok":
+            continue
+        for needed_name in importer_info.get("Needed", []):
+            matches = sorted(by_soname.get(needed_name, set()) | by_basename.get(needed_name, set()))
+            for target_path in matches:
+                edge = {
+                    "ImporterPath": importer_path,
+                    "ImporterType": "main_executable" if importer_path == process_exe else "library",
+                    "TargetPath": target_path,
+                    "NeededName": needed_name,
+                }
+                edges.append(edge)
+                incoming_by_target[target_path].append(edge)
+                outgoing_by_importer[importer_path].append(target_path)
+
+    reachable_from_exe: set[str] = set()
+    if process_exe and process_exe in parsed_map:
+        queue = list(outgoing_by_importer.get(process_exe, []))
+        while queue:
+            current = queue.pop(0)
+            if current in reachable_from_exe:
+                continue
+            reachable_from_exe.add(current)
+            queue.extend(outgoing_by_importer.get(current, []))
+
+    rows = []
+    summary = defaultdict(int)
+    for row in files:
+        row.setdefault("ImportKind", "")
+        row.setdefault("ImportedBy", "")
+        row.setdefault("NeededNames", "")
+        row.setdefault("ImportParseStatus", "")
+        row.setdefault("ImportAnalysisNote", "")
+
+    for lib_row in libraries:
+        lib_path = normalize_remote_device_path(lib_row["FilePath"])
+        parsed = parsed_map.get(lib_path, {})
+        incoming = incoming_by_target.get(lib_path, [])
+        importers = sorted({edge["ImporterPath"] for edge in incoming})
+        needed_names = sorted({edge["NeededName"] for edge in incoming})
+        if any(edge["ImporterPath"] == process_exe for edge in incoming):
+            import_kind = "needed_by_executable"
+        elif lib_path in reachable_from_exe:
+            import_kind = "needed_by_library"
+        elif incoming:
+            import_kind = "needed_by_dlopen_library"
+        elif parsed.get("ParseStatus") == "ok":
+            import_kind = "dlopen_or_runtime"
+        else:
+            import_kind = "unknown"
+
+        note = ""
+        if parsed.get("ParseStatus") not in ("", "ok"):
+            note = parsed.get("Error") or parsed.get("ParseStatus", "")
+
+        lib_row["ImportKind"] = import_kind
+        lib_row["ImportedBy"] = "; ".join(importers)
+        lib_row["NeededNames"] = "; ".join(needed_names)
+        lib_row["ImportParseStatus"] = parsed.get("ParseStatus", "")
+        lib_row["ImportAnalysisNote"] = note
+        summary[import_kind] += 1
+        rows.append(
+            {
+                "FileName": lib_row["FileName"],
+                "FilePath": lib_path,
+                "Inode": lib_row["Inode"],
+                "ImportKind": import_kind,
+                "ImportedBy": lib_row["ImportedBy"],
+                "NeededNames": lib_row["NeededNames"],
+                "Soname": parsed.get("Soname", ""),
+                "SelfNeeded": "; ".join(parsed.get("Needed", [])),
+                "ParseStatus": parsed.get("ParseStatus", ""),
+                "Note": note,
+            }
+        )
+
+    return {
+        "ProcessExe": process_exe,
+        "ExportRoot": str(export_root),
+        "Summary": dict(summary),
+        "Libraries": rows,
+        "Edges": edges,
+        "Manifest": manifest,
+    }
+
+
 def cmd_analyze_app_maps(args: argparse.Namespace) -> int:
     process_name = ""
+    process_exe = ""
+    import_analysis = None
     if args.target_pid is not None:
         client = HdcClient(args.hdc, args.device)
         process_name = client.get_process_name(args.target_pid)
+        process_exe = client.get_process_exe(args.target_pid)
     if args.output_dir:
         output_dir = Path(args.output_dir)
     elif args.target_pid is not None:
@@ -537,6 +813,20 @@ def cmd_analyze_app_maps(args: argparse.Namespace) -> int:
     input_dir = Path(args.source_dir) if args.source_dir else output_dir
     if args.target_pid is not None:
         save_proc_files(client, args.target_pid, output_dir)
+        write_json(
+            output_dir / "process_info.json",
+            {
+                "ProcessName": process_name,
+                "TargetPid": args.target_pid,
+                "ProcessExe": process_exe,
+            },
+        )
+    else:
+        process_info_path = input_dir / "process_info.json"
+        if process_info_path.exists():
+            process_info = json.loads(read_text(process_info_path))
+            process_name = process_info.get("ProcessName", process_name)
+            process_exe = process_info.get("ProcessExe", "")
 
     smaps_path = input_dir / "smaps"
     rollup_path = input_dir / "smaps_rollup"
@@ -550,27 +840,61 @@ def cmd_analyze_app_maps(args: argparse.Namespace) -> int:
     report_name = f"file_memory_{process_name}_{now_stamp()}" if process_name else f"file_memory_{now_stamp()}"
     csv_path = output_dir / f"{report_name}.csv"
     json_path = output_dir / f"{report_name}.json"
+
+    if args.analyze_library_imports:
+        export_root = output_dir / "elf_exports" if args.target_pid is not None else input_dir / "elf_exports"
+        manifest = {}
+        if args.target_pid is not None:
+            remote_paths = [row["FilePath"] for row in analysis["Files"] if row.get("IsLibrary") and row.get("FilePath")]
+            if process_exe:
+                remote_paths.append(process_exe)
+            manifest = export_remote_elfs(client, remote_paths, export_root)
+            write_json(export_root / "manifest.json", {"Files": list(manifest.values())})
+        else:
+            manifest_path = export_root / "manifest.json"
+            if manifest_path.exists():
+                payload = json.loads(read_text(manifest_path))
+                manifest = {item["RemotePath"]: item for item in payload.get("Files", []) if item.get("RemotePath")}
+        import_analysis = analyze_library_import_sources(analysis["Files"], process_exe, export_root, manifest)
+        import_csv_path = output_dir / f"{report_name}.imports.csv"
+        import_json_path = output_dir / f"{report_name}.imports.json"
+        write_csv(import_csv_path, import_analysis["Libraries"])
+        write_json(import_json_path, import_analysis)
+
     write_csv(csv_path, analysis["Files"])
-    report = {"SourceDir": str(input_dir), "ProcessName": process_name, "Rollup": rollup, "Summary": analysis["Summary"], "Files": analysis["Files"]}
+    report = {
+        "SourceDir": str(input_dir),
+        "ProcessName": process_name,
+        "ProcessExe": process_exe,
+        "Rollup": rollup,
+        "Summary": analysis["Summary"],
+        "Files": analysis["Files"],
+    }
+    if import_analysis is not None:
+        report["ImportAnalysis"] = import_analysis
     write_json(json_path, report)
 
-    print_kv(
-        "File memory summary",
-        [
-            ("Process total RSS", f"{rollup.get('Rss', 0)} kB"),
-            ("Process total PSS", f"{rollup.get('Pss', 0)} kB"),
-            ("Tracked files", analysis["Summary"]["FileCount"]),
-            ("Tracked libraries", analysis["Summary"]["LibraryCount"]),
-            ("File-backed RSS", f"{analysis['Summary']['FileRssKB']} kB"),
-            ("File-backed PSS", f"{analysis['Summary']['FilePssKB']} kB"),
-            ("Bss RSS", f"{analysis['Summary']['BssRssKB']} kB"),
-            ("Bss PSS", f"{analysis['Summary']['BssPssKB']} kB"),
-            ("Tracked total RSS", f"{analysis['Summary']['TotalRssKB']} kB"),
-            ("Tracked total PSS", f"{analysis['Summary']['TotalPssKB']} kB"),
-            ("CSV report", csv_path),
-            ("JSON report", json_path),
-        ],
-    )
+    summary_rows = [
+        ("Process total RSS", f"{rollup.get('Rss', 0)} kB"),
+        ("Process total PSS", f"{rollup.get('Pss', 0)} kB"),
+        ("Tracked files", analysis["Summary"]["FileCount"]),
+        ("Tracked libraries", analysis["Summary"]["LibraryCount"]),
+        ("File-backed RSS", f"{analysis['Summary']['FileRssKB']} kB"),
+        ("File-backed PSS", f"{analysis['Summary']['FilePssKB']} kB"),
+        ("Bss RSS", f"{analysis['Summary']['BssRssKB']} kB"),
+        ("Bss PSS", f"{analysis['Summary']['BssPssKB']} kB"),
+        ("Tracked total RSS", f"{analysis['Summary']['TotalRssKB']} kB"),
+        ("Tracked total PSS", f"{analysis['Summary']['TotalPssKB']} kB"),
+        ("CSV report", csv_path),
+        ("JSON report", json_path),
+        ("Import analysis", "enabled" if import_analysis is not None else "disabled"),
+    ]
+    if import_analysis is not None:
+        summary_rows.append(("Import kinds", json.dumps(import_analysis["Summary"], ensure_ascii=False)))
+        summary_rows.append(("ELF export root", import_analysis["ExportRoot"]))
+        summary_rows.append(("Import CSV", import_csv_path))
+        summary_rows.append(("Import JSON", import_json_path))
+    print_kv("File memory summary", summary_rows)
     for row in analysis["Files"][:30]:
         print(f"{row['FileName']}\t{row['FileType']}\tlib={row['IsLibrary']}\tTotalPssKB={row['TotalPssKB']}\tTotalRssKB={row['TotalRssKB']}\t{row['FilePath']}")
     if args.json:
@@ -1148,6 +1472,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_group.add_argument("--target-pid", type=int)
     source_group.add_argument("--source-dir")
     app_maps.add_argument("--output-dir")
+    app_maps.add_argument("-I", "--analyze-imports", "--analyze-library-imports", dest="analyze_library_imports", action="store_true")
     app_maps.add_argument("--keep-raw-files", action="store_true")
     app_maps.add_argument("--json", action="store_true")
     app_maps.set_defaults(func=cmd_analyze_app_maps)

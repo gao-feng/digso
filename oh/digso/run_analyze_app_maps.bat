@@ -25,14 +25,29 @@ if "%~1"=="" (
 )
 
 set "OUTPUT_ARG="
-if not "%~2"=="" (
+set "IMPORT_ARG="
+if /I "%~2"=="-I" (
+  set "IMPORT_ARG= -I"
+) else if /I "%~2"=="--analyze-imports" (
+  set "IMPORT_ARG= --analyze-imports"
+) else if /I "%~2"=="--analyze-library-imports" (
+  set "IMPORT_ARG= --analyze-imports"
+) else if not "%~2"=="" (
   set "OUTPUT_ARG= --output-dir ""%~2"""
 )
 
+if /I "%~3"=="-I" (
+  set "IMPORT_ARG= -I"
+) else if /I "%~3"=="--analyze-imports" (
+  set "IMPORT_ARG= --analyze-imports"
+) else if /I "%~3"=="--analyze-library-imports" (
+  set "IMPORT_ARG= --analyze-imports"
+)
+
 if exist "%ARG1%\\smaps" (
-  python "%PY_SCRIPT%" analyze-app-maps --source-dir "%ARG1%"%OUTPUT_ARG%
+  python "%PY_SCRIPT%" analyze-app-maps --source-dir "%ARG1%"%OUTPUT_ARG%%IMPORT_ARG%
 ) else (
-  python "%PY_SCRIPT%" analyze-app-maps --target-pid %ARG1%%OUTPUT_ARG%
+  python "%PY_SCRIPT%" analyze-app-maps --target-pid %ARG1%%OUTPUT_ARG%%IMPORT_ARG%
 )
 
 exit /b %errorlevel%
