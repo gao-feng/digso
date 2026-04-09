@@ -29,6 +29,12 @@ Enable library import-source analysis for the same flow:
 python oh/digso/digso.py analyze-app-maps --target-pid 12345 -I
 ```
 
+Use a specific local ELF cache/export directory:
+
+```bash
+python oh/digso/digso.py analyze-app-maps --target-pid 12345 -I --elf-dir D:/digso_logs/elf_exports
+```
+
 Analyze an already captured directory:
 
 ```bash
@@ -72,6 +78,6 @@ python oh/digso/digso.py force-swapout-memcg 12345
 - For device selection, use `--device <serial>` on the capture commands.
 - If you do not pass an output directory, each run creates a timestamped subdirectory under the platform default log root.
 - The `.bat` wrappers also accept an optional trailing output-directory argument, for example `run_compare_so_snapshots.bat before after D:/custom_logs`.
-- `analyze-app-maps -I` is the short form for import-source analysis. It exports the loaded ELF files into `elf_exports/`, parses `DT_NEEDED`, and classifies loaded libraries as `needed_by_executable`, `needed_by_library`, `needed_by_dlopen_library`, `dlopen_or_runtime`, or `unknown`.
+- `analyze-app-maps -I` is the short form for import-source analysis. It first checks a local ELF cache directory, and only exports missing files from the device. The default cache/export root is `D:/digso_logs/elf_exports` on Windows and `/data/digso_logs/elf_exports` on Linux. You can override it with `--elf-dir`.
 - The same `-I` flow also writes a Mermaid dependency graph as `file_memory_xxx.imports.mmd`.
-- `run_analyze_app_maps.bat` also accepts `-I` or `--analyze-imports` as the second or third argument.
+- `run_analyze_app_maps.bat` also accepts `-I` or `--analyze-imports`, and can additionally pass an ELF cache directory via a later `--elf-dir` position.

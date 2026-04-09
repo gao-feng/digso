@@ -26,6 +26,7 @@ if "%~1"=="" (
 
 set "OUTPUT_ARG="
 set "IMPORT_ARG="
+set "ELF_ARG="
 if /I "%~2"=="-I" (
   set "IMPORT_ARG= -I"
 ) else if /I "%~2"=="--analyze-imports" (
@@ -42,12 +43,24 @@ if /I "%~3"=="-I" (
   set "IMPORT_ARG= --analyze-imports"
 ) else if /I "%~3"=="--analyze-library-imports" (
   set "IMPORT_ARG= --analyze-imports"
+ ) else if not "%~3"=="" (
+  set "ELF_ARG= --elf-dir ""%~3"""
+)
+
+if /I "%~4"=="-I" (
+  set "IMPORT_ARG= -I"
+) else if /I "%~4"=="--analyze-imports" (
+  set "IMPORT_ARG= --analyze-imports"
+) else if /I "%~4"=="--analyze-library-imports" (
+  set "IMPORT_ARG= --analyze-imports"
+) else if not "%~4"=="" (
+  set "ELF_ARG= --elf-dir ""%~4"""
 )
 
 if exist "%ARG1%\\smaps" (
-  python "%PY_SCRIPT%" analyze-app-maps --source-dir "%ARG1%"%OUTPUT_ARG%%IMPORT_ARG%
+  python "%PY_SCRIPT%" analyze-app-maps --source-dir "%ARG1%"%OUTPUT_ARG%%ELF_ARG%%IMPORT_ARG%
 ) else (
-  python "%PY_SCRIPT%" analyze-app-maps --target-pid %ARG1%%OUTPUT_ARG%%IMPORT_ARG%
+  python "%PY_SCRIPT%" analyze-app-maps --target-pid %ARG1%%OUTPUT_ARG%%ELF_ARG%%IMPORT_ARG%
 )
 
 exit /b %errorlevel%

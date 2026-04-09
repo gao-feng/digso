@@ -58,6 +58,12 @@ def default_output_root() -> Path:
     return ensure_dir(Path("/data/digso_logs"))
 
 
+def default_elf_cache_root() -> Path:
+    if os.name == "nt":
+        return ensure_dir(Path("D:/digso_logs/elf_exports"))
+    return ensure_dir(Path("/data/digso_logs/elf_exports"))
+
+
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
@@ -97,6 +103,37 @@ def remote_path_to_local_export_path(remote_path: str, export_root: Path) -> Pat
     parts = [part for part in normalize_remote_device_path(remote_path).split("/") if part]
     safe_parts = [part.replace(":", "_") for part in parts]
     return export_root.joinpath(*safe_parts)
+
+
+def remote_path_suffix_key(remote_path: str) -> str:
+    return "/".join(part for part in normalize_remote_device_path(remote_path).split("/") if part)
+
+
+def find_existing_exported_elf(remote_path: str, search_root: Path) -> Path | None:
+    expected = remote_path_to_local_export_path(remote_path, search_root)
+    if expected.exists():
+        return expected
+
+    basename = os.path.basename(remote_path)
+    if not basename or not search_root.exists():
+        return None
+
+    suffix_key = remote_path_suffix_key(remote_path).lower()
+    candidates = [path for path in search_root.rglob(basename) if path.is_file()]
+    if not candidates:
+        return None
+
+    ranked = []
+    for candidate in candidates:
+        candidate_key = candidate.as_posix().lower()
+        score = 0
+        if candidate_key.endswith(suffix_key):
+            score += 1000
+        score += len(os.path.commonprefix([candidate_key, suffix_key]))
+        ranked.append((score, len(candidate.parts), candidate))
+
+    ranked.sort(key=lambda item: (-item[0], item[1], str(item[2])))
+    return ranked[0][2]
 
 
 def vaddr_to_file_offset(vaddr: int, load_segments: list[dict]) -> int | None:
@@ -653,14 +690,37 @@ def export_remote_elfs(client: HdcClient, remote_paths: list[str], export_root: 
     ensure_dir(export_root)
     manifest: dict[str, dict] = {}
     for remote_path in sorted({normalize_remote_device_path(item) for item in remote_paths if item}):
+        existing_local_path = find_existing_exported_elf(remote_path, export_root)
+        if existing_local_path is not None:
+            manifest[remote_path] = {
+                "RemotePath": remote_path,
+                "LocalPath": str(existing_local_path),
+                "Exported": False,
+                "ReusedLocal": True,
+                "Error": "",
+            }
+            continue
+
         local_path = remote_path_to_local_export_path(remote_path, export_root)
         ensure_dir(local_path.parent)
         try:
             info(f"Exporting ELF: {remote_path}")
             client.recv(remote_path, local_path)
-            manifest[remote_path] = {"RemotePath": remote_path, "LocalPath": str(local_path), "Exported": True, "Error": ""}
+            manifest[remote_path] = {
+                "RemotePath": remote_path,
+                "LocalPath": str(local_path),
+                "Exported": True,
+                "ReusedLocal": False,
+                "Error": "",
+            }
         except DigsoError as exc:
-            manifest[remote_path] = {"RemotePath": remote_path, "LocalPath": str(local_path), "Exported": False, "Error": str(exc)}
+            manifest[remote_path] = {
+                "RemotePath": remote_path,
+                "LocalPath": str(local_path),
+                "Exported": False,
+                "ReusedLocal": False,
+                "Error": str(exc),
+            }
     return manifest
 
 
@@ -675,12 +735,21 @@ def analyze_library_import_sources(files: list[dict], process_exe: str, export_r
         candidate_paths.append(normalize_remote_device_path(process_exe))
 
     for remote_path in sorted(set(candidate_paths)):
-        local_path = remote_path_to_local_export_path(remote_path, export_root)
-        export_info = manifest.get(remote_path, {"Exported": local_path.exists(), "Error": "", "LocalPath": str(local_path)})
+        local_path = find_existing_exported_elf(remote_path, export_root) or remote_path_to_local_export_path(remote_path, export_root)
+        export_info = manifest.get(
+            remote_path,
+            {
+                "Exported": False,
+                "ReusedLocal": local_path.exists(),
+                "Error": "",
+                "LocalPath": str(local_path),
+            },
+        )
         parsed = {
             "RemotePath": remote_path,
             "LocalPath": str(local_path),
             "Exported": bool(export_info.get("Exported", local_path.exists())),
+            "ReusedLocal": bool(export_info.get("ReusedLocal", local_path.exists())),
             "ParseStatus": "missing_local_copy",
             "Error": export_info.get("Error", ""),
             "Soname": "",
@@ -779,6 +848,9 @@ def analyze_library_import_sources(files: list[dict], process_exe: str, export_r
                 "NeededNames": lib_row["NeededNames"],
                 "Soname": parsed.get("Soname", ""),
                 "SelfNeeded": "; ".join(parsed.get("Needed", [])),
+                "LocalPath": parsed.get("LocalPath", ""),
+                "Exported": parsed.get("Exported", False),
+                "ReusedLocal": parsed.get("ReusedLocal", False),
                 "ParseStatus": parsed.get("ParseStatus", ""),
                 "Note": note,
             }
@@ -912,7 +984,8 @@ def cmd_analyze_app_maps(args: argparse.Namespace) -> int:
     json_path = output_dir / f"{report_name}.json"
 
     if args.analyze_library_imports:
-        export_root = output_dir / "elf_exports" if args.target_pid is not None else input_dir / "elf_exports"
+        export_root = Path(args.elf_dir) if args.elf_dir else default_elf_cache_root()
+        ensure_dir(export_root)
         manifest = {}
         if args.target_pid is not None:
             remote_paths = [row["FilePath"] for row in analysis["Files"] if row.get("IsLibrary") and row.get("FilePath")]
@@ -1546,6 +1619,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_group.add_argument("--source-dir")
     app_maps.add_argument("--output-dir")
     app_maps.add_argument("-I", "--analyze-imports", "--analyze-library-imports", dest="analyze_library_imports", action="store_true")
+    app_maps.add_argument("--elf-dir")
     app_maps.add_argument("--keep-raw-files", action="store_true")
     app_maps.add_argument("--json", action="store_true")
     app_maps.set_defaults(func=cmd_analyze_app_maps)
