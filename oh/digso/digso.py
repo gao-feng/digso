@@ -47,6 +47,10 @@ def safe_name(name: str | None) -> str:
     return cleaned or "unknown"
 
 
+def shell_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -906,6 +910,137 @@ def save_proc_maps(client: HdcClient, pid: int, local_path: Path, suffix: str) -
     client.save_remote_text_file(f"/proc/{pid}/maps", local_path, f"/data/{pid}_{suffix}")
 
 
+def chunk_remote_stat_paths(paths: list[str], max_command_len: int = 24000) -> list[list[str]]:
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    current_len = 0
+    for path in paths:
+        quoted = shell_quote(path)
+        extra_len = len(quoted) + 1
+        if current and current_len + extra_len > max_command_len:
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(path)
+        current_len += extra_len
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def parse_remote_stat_output(output: str) -> dict[str, dict]:
+    results: dict[str, dict] = {}
+    for line in split_lines(output):
+        parts = line.split("\t", 4)
+        if not parts:
+            continue
+        if parts[0] == "OK" and len(parts) == 5:
+            path = parts[4]
+            try:
+                size_bytes = int(parts[1])
+                blocks = int(parts[2])
+                block_size = int(parts[3])
+            except ValueError:
+                results[path] = {
+                    "DiskUsageStatus": "error",
+                    "DiskUsageError": f"cannot parse stat line: {line}",
+                }
+                continue
+            allocated_bytes = blocks * block_size
+            results[path] = {
+                "DiskUsageStatus": "ok",
+                "DiskFileSizeBytes": size_bytes,
+                "DiskFileSizeKB": (size_bytes + 1023) // 1024,
+                "DiskAllocatedBytes": allocated_bytes,
+                "DiskAllocatedKB": (allocated_bytes + 1023) // 1024,
+                "DiskBlocks": blocks,
+                "DiskBlockSize": block_size,
+                "DiskUsageError": "",
+            }
+        elif parts[0] == "ERR" and len(parts) >= 3:
+            results[parts[1]] = {
+                "DiskUsageStatus": "error",
+                "DiskUsageError": parts[2],
+            }
+    return results
+
+
+def collect_remote_disk_usage(client: HdcClient, paths: list[str]) -> dict[str, dict]:
+    results: dict[str, dict] = {}
+    unique_paths = sorted({path for path in paths if path})
+    for chunk in chunk_remote_stat_paths(unique_paths):
+        quoted_paths = " ".join(shell_quote(path) for path in chunk)
+        command = (
+            "for p in "
+            + quoted_paths
+            + "; do "
+            + "out=$(stat -c '%s\t%b\t%B\t%n' \"$p\" 2>/dev/null); "
+            + "if [ $? -eq 0 ]; then printf 'OK\t%s\n' \"$out\"; "
+            + "else printf 'ERR\t%s\tstat_failed\n' \"$p\"; fi; "
+            + "done"
+        )
+        try:
+            results.update(parse_remote_stat_output(client.shell(command)))
+        except DigsoError as exc:
+            for path in chunk:
+                results[path] = {
+                    "DiskUsageStatus": "error",
+                    "DiskUsageError": str(exc),
+                }
+    return results
+
+
+def local_disk_usage(path_text: str) -> dict:
+    path = Path(path_text)
+    if not path.is_file():
+        return {
+            "DiskUsageStatus": "not_found",
+            "DiskUsageError": "local path not found",
+        }
+    stat_result = path.stat()
+    size_bytes = stat_result.st_size
+    blocks = getattr(stat_result, "st_blocks", None)
+    block_size = 512 if blocks is not None else getattr(stat_result, "st_blksize", 0) or 1
+    allocated_bytes = size_bytes if blocks is None else int(blocks) * block_size
+    return {
+        "DiskUsageStatus": "ok",
+        "DiskFileSizeBytes": size_bytes,
+        "DiskFileSizeKB": (size_bytes + 1023) // 1024,
+        "DiskAllocatedBytes": allocated_bytes,
+        "DiskAllocatedKB": (allocated_bytes + 1023) // 1024,
+        "DiskBlocks": "" if blocks is None else int(blocks),
+        "DiskBlockSize": block_size,
+        "DiskUsageError": "",
+    }
+
+
+def apply_disk_usage_to_analysis(analysis: dict, disk_usage_by_path: dict[str, dict]) -> None:
+    default_info = {
+        "DiskUsageStatus": "not_queried",
+        "DiskFileSizeBytes": "",
+        "DiskFileSizeKB": "",
+        "DiskAllocatedBytes": "",
+        "DiskAllocatedKB": "",
+        "DiskBlocks": "",
+        "DiskBlockSize": "",
+        "DiskUsageError": "",
+    }
+    ok_count = 0
+    allocated_kb = 0
+    file_size_kb = 0
+    for row in analysis["Files"]:
+        info_row = {**default_info, **disk_usage_by_path.get(row["FilePath"], {})}
+        row.update(info_row)
+        if row["DiskUsageStatus"] == "ok":
+            ok_count += 1
+            allocated_kb += int(row["DiskAllocatedKB"])
+            file_size_kb += int(row["DiskFileSizeKB"])
+    analysis["Summary"]["DiskUsageQueriedCount"] = ok_count
+    analysis["Summary"]["DiskFileSizeKB"] = file_size_kb
+    analysis["Summary"]["DiskAllocatedKB"] = allocated_kb
+    analysis["Summary"]["DiskUsageMissingCount"] = len(analysis["Files"]) - ok_count
+
+
 def analyze_remote_pagemap(
     client: HdcClient,
     pid: int,
@@ -1315,6 +1450,12 @@ def cmd_analyze_app_maps(args: argparse.Namespace) -> int:
     ensure_dir(output_dir)
     info(f"Parsing {smaps_path}")
     analysis = analyze_file_mappings(parse_smaps(smaps_path))
+    file_paths = [row["FilePath"] for row in analysis["Files"] if row.get("FilePath")]
+    if args.target_pid is not None:
+        info(f"Querying disk usage for {len(set(file_paths))} mapped file(s)")
+        apply_disk_usage_to_analysis(analysis, collect_remote_disk_usage(client, file_paths))
+    else:
+        apply_disk_usage_to_analysis(analysis, {path: local_disk_usage(path) for path in sorted(set(file_paths))})
     rollup = parse_rollup(rollup_path)
     pagemap_analysis = None
     report_name = f"file_memory_{process_name}_{now_stamp()}" if process_name else f"file_memory_{now_stamp()}"
@@ -1414,6 +1555,9 @@ def cmd_analyze_app_maps(args: argparse.Namespace) -> int:
         ("Bss PSS", f"{analysis['Summary']['BssPssKB']} kB"),
         ("Tracked total RSS", f"{analysis['Summary']['TotalRssKB']} kB"),
         ("Tracked total PSS", f"{analysis['Summary']['TotalPssKB']} kB"),
+        ("Disk usage files", f"{analysis['Summary']['DiskUsageQueriedCount']}/{analysis['Summary']['FileCount']}"),
+        ("Disk file size", f"{analysis['Summary']['DiskFileSizeKB']} kB"),
+        ("Disk allocated", f"{analysis['Summary']['DiskAllocatedKB']} kB"),
         ("CSV report", csv_path),
         ("JSON report", json_path),
         ("Pagemap analysis", "enabled" if pagemap_analysis is not None else "disabled"),

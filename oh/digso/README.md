@@ -40,6 +40,25 @@ Analyze one process and generate file-backed memory reports:
 python oh/digso/digso.py analyze-app-maps --target-pid 12345
 ```
 
+The file report also includes disk usage fields for mapped files. For a live `--target-pid`, the tool queries the target device with `stat`; for `--source-dir`, it only fills these fields when the same path exists on the local machine.
+
+文件报告也会输出映射文件的磁盘占用字段。使用 live `--target-pid` 时，工具会在目标设备上通过 `stat` 查询；使用 `--source-dir` 离线分析时，只有同一路径在本机真实存在，才会填充这些字段。
+
+Relevant fields:
+
+相关字段：
+
+- `DiskFileSizeKB`: apparent file size from filesystem metadata
+- `DiskAllocatedKB`: real allocated disk space, calculated from allocated blocks
+- `DiskBlocks`: allocated block count reported by `stat`
+- `DiskBlockSize`: block size used with `DiskBlocks`
+- `DiskUsageStatus`: `ok`, `error`, `not_found`, or `not_queried`
+- `DiskFileSizeKB`：文件系统元数据里的文件逻辑大小
+- `DiskAllocatedKB`：真实占用的磁盘空间，按已分配 block 计算
+- `DiskBlocks`：`stat` 返回的已分配 block 数
+- `DiskBlockSize`：与 `DiskBlocks` 配套使用的 block 大小
+- `DiskUsageStatus`：查询状态，可能是 `ok`、`error`、`not_found` 或 `not_queried`
+
 Pagemap analysis is disabled by default because it is expensive on processes
 with large `maps` files. Enable it explicitly when needed:
 
