@@ -931,37 +931,21 @@ def chunk_remote_stat_paths(paths: list[str], max_command_len: int = 24000) -> l
 def parse_remote_stat_output(output: str) -> dict[str, dict]:
     results: dict[str, dict] = {}
     for line in split_lines(output):
-        parts = line.split("\t", 4)
+        parts = line.split("\t", 2)
         if not parts:
             continue
-        if parts[0] == "OK" and len(parts) == 5:
-            path = parts[4]
+        if parts[0] == "OK" and len(parts) == 3:
+            path = parts[2]
             try:
                 size_bytes = int(parts[1])
-                blocks = int(parts[2])
-                block_size = int(parts[3])
             except ValueError:
-                results[path] = {
-                    "DiskUsageStatus": "error",
-                    "DiskUsageError": f"cannot parse stat line: {line}",
-                }
+                results[path] = {}
                 continue
-            allocated_bytes = blocks * block_size
             results[path] = {
-                "DiskUsageStatus": "ok",
-                "DiskFileSizeBytes": size_bytes,
                 "DiskFileSizeKB": (size_bytes + 1023) // 1024,
-                "DiskAllocatedBytes": allocated_bytes,
-                "DiskAllocatedKB": (allocated_bytes + 1023) // 1024,
-                "DiskBlocks": blocks,
-                "DiskBlockSize": block_size,
-                "DiskUsageError": "",
             }
-        elif parts[0] == "ERR" and len(parts) >= 3:
-            results[parts[1]] = {
-                "DiskUsageStatus": "error",
-                "DiskUsageError": parts[2],
-            }
+        elif parts[0] == "ERR" and len(parts) >= 2:
+            results[parts[1]] = {}
     return results
 
 
@@ -974,70 +958,40 @@ def collect_remote_disk_usage(client: HdcClient, paths: list[str]) -> dict[str, 
             "for p in "
             + quoted_paths
             + "; do "
-            + "out=$(stat -c '%s\t%b\t%B\t%n' \"$p\" 2>/dev/null); "
+            + "out=$(stat -c '%s\t%n' \"$p\" 2>/dev/null); "
             + "if [ $? -eq 0 ]; then printf 'OK\t%s\n' \"$out\"; "
-            + "else printf 'ERR\t%s\tstat_failed\n' \"$p\"; fi; "
+            + "else printf 'ERR\t%s\n' \"$p\"; fi; "
             + "done"
         )
         try:
             results.update(parse_remote_stat_output(client.shell(command)))
-        except DigsoError as exc:
+        except DigsoError:
             for path in chunk:
-                results[path] = {
-                    "DiskUsageStatus": "error",
-                    "DiskUsageError": str(exc),
-                }
+                results[path] = {}
     return results
 
 
 def local_disk_usage(path_text: str) -> dict:
     path = Path(path_text)
     if not path.is_file():
-        return {
-            "DiskUsageStatus": "not_found",
-            "DiskUsageError": "local path not found",
-        }
-    stat_result = path.stat()
-    size_bytes = stat_result.st_size
-    blocks = getattr(stat_result, "st_blocks", None)
-    block_size = 512 if blocks is not None else getattr(stat_result, "st_blksize", 0) or 1
-    allocated_bytes = size_bytes if blocks is None else int(blocks) * block_size
+        return {}
+    size_bytes = path.stat().st_size
     return {
-        "DiskUsageStatus": "ok",
-        "DiskFileSizeBytes": size_bytes,
         "DiskFileSizeKB": (size_bytes + 1023) // 1024,
-        "DiskAllocatedBytes": allocated_bytes,
-        "DiskAllocatedKB": (allocated_bytes + 1023) // 1024,
-        "DiskBlocks": "" if blocks is None else int(blocks),
-        "DiskBlockSize": block_size,
-        "DiskUsageError": "",
     }
 
 
 def apply_disk_usage_to_analysis(analysis: dict, disk_usage_by_path: dict[str, dict]) -> None:
-    default_info = {
-        "DiskUsageStatus": "not_queried",
-        "DiskFileSizeBytes": "",
-        "DiskFileSizeKB": "",
-        "DiskAllocatedBytes": "",
-        "DiskAllocatedKB": "",
-        "DiskBlocks": "",
-        "DiskBlockSize": "",
-        "DiskUsageError": "",
-    }
     ok_count = 0
-    allocated_kb = 0
     file_size_kb = 0
     for row in analysis["Files"]:
-        info_row = {**default_info, **disk_usage_by_path.get(row["FilePath"], {})}
-        row.update(info_row)
-        if row["DiskUsageStatus"] == "ok":
+        disk_file_size_kb = disk_usage_by_path.get(row["FilePath"], {}).get("DiskFileSizeKB", "")
+        row["DiskFileSizeKB"] = disk_file_size_kb
+        if disk_file_size_kb != "":
             ok_count += 1
-            allocated_kb += int(row["DiskAllocatedKB"])
-            file_size_kb += int(row["DiskFileSizeKB"])
+            file_size_kb += int(disk_file_size_kb)
     analysis["Summary"]["DiskUsageQueriedCount"] = ok_count
     analysis["Summary"]["DiskFileSizeKB"] = file_size_kb
-    analysis["Summary"]["DiskAllocatedKB"] = allocated_kb
     analysis["Summary"]["DiskUsageMissingCount"] = len(analysis["Files"]) - ok_count
 
 
@@ -1557,7 +1511,6 @@ def cmd_analyze_app_maps(args: argparse.Namespace) -> int:
         ("Tracked total PSS", f"{analysis['Summary']['TotalPssKB']} kB"),
         ("Disk usage files", f"{analysis['Summary']['DiskUsageQueriedCount']}/{analysis['Summary']['FileCount']}"),
         ("Disk file size", f"{analysis['Summary']['DiskFileSizeKB']} kB"),
-        ("Disk allocated", f"{analysis['Summary']['DiskAllocatedKB']} kB"),
         ("CSV report", csv_path),
         ("JSON report", json_path),
         ("Pagemap analysis", "enabled" if pagemap_analysis is not None else "disabled"),
